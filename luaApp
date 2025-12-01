@@ -37,6 +37,15 @@ local function removeHighlight(userId)
 	end
 end
 
+-- Remove a specific announcement from the queue by GlobalID
+local function removeFromQueue(globalId)
+	for i, ann in ipairs(announcementQueue) do
+		if ann.GlobalID == globalId then
+			table.remove(announcementQueue, i)
+			break
+		end
+	end
+end
 
 -- put a highlight on the player currently being highlighted and give to the player how many ppl joined from their announcement
 local function highlightPlayer(plr)
