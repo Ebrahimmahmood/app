@@ -1,0 +1,246 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MessagingService = game:GetService("MessagingService")
+local HttpService = game:GetService("HttpService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+
+
+local AR = ReplicatedStorage:WaitForChild("announcementRemote")
+local myAR = ReplicatedStorage:WaitForChild("myAr")
+local noti = require(ReplicatedStorage:WaitForChild("notificationModule"))
+
+local module = {}
+
+-- Constants
+local ANNOUNCE_TOPIC = "GlobalAnnouncementQueue"
+local SNAPSHOT_REQUEST = "GlobalAnnouncementSnapshotRequest"
+local SNAPSHOT_RESPONSE_PREFIX = "GlobalAnnouncementSnapshot_"
+local ANNOUNCE_DURATION = 10 -- seconds
+local PROCESSED_CLEANUP_INTERVAL = 300
+local PROCESSED_EXPIRY = 86400
+local webHookUrl = "NOTGIVENFORSECURITY"
+local lockMap = MemoryStoreService:GetSortedMap("GlobalAnnouncementDiscordLocks")
+
+-- State
+local announcementQueue = {}
+local processedAnnouncements = {}
+local activeHighlights = {}
+local serverGuid = HttpService:GenerateGUID(false)
+local isProcessing = false
+local currentAnnouncementStartTime = nil 
+
+-- helper function to remove highlights
+local function removeHighlight(userId)
+	if activeHighlights[userId] then
+		pcall(function() activeHighlights[userId]:Destroy() end)
+		activeHighlights[userId] = nil
+	end
+end
+
+
+-- put a highlight on the player currently being highlighted and give to the player how many ppl joined from their announcement
+local function highlightPlayer(plr)
+	if not plr or not plr.Character or not plr.Character:FindFirstChild("Humanoid") then return end
+
+	removeHighlight(plr.UserId)
+
+	local highlight = Instance.new("Highlight")
+	highlight.Adornee = plr.Character
+	highlight.FillColor = Color3.fromRGB(255, 0, 4)
+	highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+	highlight.FillTransparency = 0.5
+	highlight.OutlineTransparency = 0
+	highlight.Parent = plr.Character
+	activeHighlights[plr.UserId] = highlight
+
+	local humanoid = plr.Character:FindFirstChild("Humanoid")
+	if humanoid then
+		humanoid.Died:Once(function() removeHighlight(plr.UserId) end)
+	end
+
+	task.delay(ANNOUNCE_DURATION, function() removeHighlight(plr.UserId) end)
+
+	task.spawn(function()
+		task.wait(ANNOUNCE_DURATION)
+		if plr and plr.Parent then
+			local joinedCount = plr:GetAttribute("Joins") or 0
+			if joinedCount > 0 then
+				noti.createNotification(plr, "🎉 "..joinedCount.." player(s) joined from your announcement!", 5)
+				plr:SetAttribute("Joins", 0)
+			end
+		end
+	end)
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+	removeHighlight(plr.UserId)
+end)
+
+-- insert the data into announcement queue
+local function enqueueAnnouncement(data)
+	if data and data.GlobalID and not processedAnnouncements[data.GlobalID] then
+		table.insert(announcementQueue, data)
+	end
+end
+
+-- Listen for announcement snapshots from other servers and add any new announcements to the queue essentially when a new server is created the announcements will sync
+pcall(function()
+	MessagingService:SubscribeAsync(SNAPSHOT_RESPONSE_PREFIX..serverGuid, function(msg)
+		local snapshot = msg.Data
+		if typeof(snapshot) == "table" then
+
+			local queue = snapshot.queue or {}
+			local currentStartTime = snapshot.currentStartTime
+
+			for _, ann in ipairs(queue) do
+				if not processedAnnouncements[ann.GlobalID] then
+					enqueueAnnouncement(ann)
+				end
+			end
+
+			if currentStartTime and isProcessing == false and #announcementQueue > 0 then
+				local elapsed = tick() - currentStartTime
+				local remaining = math.max(0, ANNOUNCE_DURATION - elapsed)
+
+				if remaining > 0 then
+					task.spawn(function()
+						task.wait(remaining)
+					end)
+				end
+			end
+		end
+	end)
+end)
+
+--when a new announce from any server is posted we enqueue it adding it to our announcement queue
+pcall(function()
+	MessagingService:SubscribeAsync(ANNOUNCE_TOPIC, function(msg)
+		local data = msg.Data
+		if typeof(data) == "table" then
+			enqueueAnnouncement(data)
+		end
+	end)
+end)
+
+pcall(function()
+	MessagingService:SubscribeAsync(SNAPSHOT_REQUEST, function(msg)
+		local requestingGuid = msg.Data
+		if requestingGuid ~= serverGuid then
+			local response = {
+				queue = announcementQueue,
+				currentStartTime = currentAnnouncementStartTime,
+				isProcessing = isProcessing
+			}
+			MessagingService:PublishAsync(SNAPSHOT_RESPONSE_PREFIX..requestingGuid, response)
+		end
+	end)
+end)
+
+-- inital snapshot request to sync up announcements
+task.spawn(function()
+	task.wait(0.5) 
+	MessagingService:PublishAsync(SNAPSHOT_REQUEST, serverGuid)
+end)
+
+-- clean up already processed announcements if their tick() is passed their expiry time
+task.spawn(function()
+	while true do
+		task.wait(PROCESSED_CLEANUP_INTERVAL)
+		local now = tick()
+		for id, expiry in pairs(processedAnnouncements) do
+			if now > expiry then
+				processedAnnouncements[id] = nil
+			end
+		end
+	end
+end)
+
+
+-- function to post a discord webhook 
+local function postProcessedWebhook(ann, payload)
+	task.spawn(function()
+		local shouldSendWebhook = false
+
+		local lockSuccess = pcall(function()
+			lockMap:UpdateAsync(ann.GlobalID, function(old)
+				if old then
+					return old
+				else
+					shouldSendWebhook = true
+					return tick()
+				end
+			end, 30)
+		end)
+
+		if lockSuccess and shouldSendWebhook then
+			local success, err = pcall(function()
+				HttpService:PostAsync(webHookUrl, HttpService:JSONEncode(payload), Enum.HttpContentType.ApplicationJson)
+			end)
+			if not success then
+				warn("Discord webhook failed:", err)
+			else
+				print("Webhook sent for:", ann.GlobalID)
+			end
+		elseif not shouldSendWebhook then
+			print("Another server already sent webhook for:", ann.GlobalID)
+		end
+	end)
+end
+
+-- main announcement processing loop
+task.spawn(function()
+	while true do
+		if not isProcessing and #announcementQueue > 0 then
+			isProcessing = true
+			currentAnnouncementStartTime = tick()
+
+			local ann = table.remove(announcementQueue, 1)
+			if ann and not processedAnnouncements[ann.GlobalID] then
+				local plr = Players:GetPlayerByUserId(ann.UserId)
+
+				local payload = {
+					username = "Global Announcements",
+					embeds = {{
+						title = "🌐 New Global Announcement",
+						color = 0x00A2FF,
+						fields = {
+							{name="Text", value=ann.Text or "No text", inline=false},
+							{name="Player", value=(plr and plr.DisplayName or ann.Name).." (@"..ann.Name..")", inline=false},
+							{name="User ID", value=tostring(ann.UserId), inline=true},
+							{name="Payment Method", value=tostring(ann.PaymentMethod or "Unknown"), inline=true},
+							{name="Queue Position", value=tostring(ann.QueuePosition or "N/A"), inline=true},
+							{name="Global Announcement ID", value=ann.GlobalID, inline=false},
+							{name="Server Version", value=tostring(game.PlaceVersion), inline=false}
+						},
+						timestamp = DateTime.now():ToIsoDate()
+					}}
+				}
+
+				-- Post webhook using the new function
+				postProcessedWebhook(ann, payload)
+
+				if plr then
+					highlightPlayer(plr)
+					noti.createNotification(plr, "You are highlighted for "..ANNOUNCE_DURATION.." seconds!")
+				end
+
+				AR:FireAllClients(ann)
+				processedAnnouncements[ann.GlobalID] = tick() + ANNOUNCE_DURATION
+				task.wait(ANNOUNCE_DURATION)
+			end
+
+			currentAnnouncementStartTime = nil
+			isProcessing = false
+		else
+			task.wait(0.1)
+		end
+	end
+end)
+
+
+-- this is a function which will return the legnth of announcement queue providing a simple way to access how many players are in queue
+function module.getQueue()
+	return #announcementQueue
+end
+
+return module
